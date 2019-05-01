@@ -1,0 +1,479 @@
+---
+title: "Cable Inspections & Complaints"
+author: "A.S."
+date: "March 19, 2019 - May 2, 2019"
+output: html_document
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(fig.width = 9, fig.height = 6, warning = FALSE, message = FALSE, fig.align = "center")
+library(knitr)
+library(ggmap)
+library(leaflet)
+library(dplyr)
+library(ggplot2)
+library(wellknown)
+library(readr)
+library(htmltools)
+library(geojsonio)
+library(rgdal)
+library(tidyr)
+library(stringr)
+library(kableExtra)
+library(lubridate)
+library(scales)
+```
+
+In this project, I analyze and visualize open data from the Montgomery County data portal, dataMontgomery. I used the sets [Cable Inspections](https://data.montgomerycountymd.gov/Government/Cable-Inspections/tzyi-s757) and [Cable Complaints](https://data.montgomerycountymd.gov/Government/Cable-Complaints/v2ei-xfce) as they appeared on the site on March 19, 2019. The data is updated quarterly.
+
+ (I attempted to use the API to fetch a live version of the data, but even after obtaining an authorization token, I had trouble getting the full set of data and in the correct format.)
+
+## Import Data & Descriptive Statistics
+
+I begin by importing the data from .csv files into R, and outputting the first few rows of each set. Let's look at the different columns there are, and also the dates of the inspections/complaints.
+
+```{r import, echo = FALSE}
+imp <- read.csv("Cable_Inspections.csv", stringsAsFactors = FALSE)
+# imp <- read.csv("https://data.montgomerycountymd.gov/resource/tzyi-s757.csv?$$app_token=REDACTED", stringsAsFactors = FALSE)
+imp$Date.Inspected <- as.Date(imp$Date.Inspected, "%m/%d/%Y")
+imp$Date.Completed <- as.Date(imp$Date.Completed, "%m/%d/%Y")
+imp$Cable.Company <- as.factor(imp$Cable.Company)
+imp$Violation.Type <- as.factor(imp$Violation.Type)
+
+head(imp, 30) %>%
+  kable(caption = "Cable Inspections") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive"), full_width = F) %>%
+  scroll_box(width = "auto", height = "400px")
+# str(imp)
+
+complaints <- read.csv("Cable_Complaints.csv", stringsAsFactors = FALSE)
+# complaints <- read.csv("https://data.montgomerycountymd.gov/resource/v2ei-xfce.csv?$$app_token=REDACTED", stringsAsFactors = FALSE)
+complaints$Date.of.Complaint <- as.Date(complaints$Date.of.Complaint, format = "%m/%d/%Y")
+complaints$Date.of.Closure <- as.Date(complaints$Date.of.Closure, format = "%m/%d/%Y")
+complaints$Cable.Provider <- as.factor(complaints$Cable.Provider)
+complaints$Type <- as.factor(complaints$Type)
+complaints$Days.to.Resolve <- as.numeric(difftime(complaints$Date.of.Closure, complaints$Date.of.Complaint, units = "days"))
+
+head(complaints, 30) %>%
+  kable(caption = "Cable Complaints") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive"), full_width = F) %>%
+  scroll_box(width = "auto", height = "400px")
+# str(complaints)
+```
+
+## Questions
+
+Let's think of some questions that people may have about cable inspections and complaints in Montgomery County based on the kind of information we have in these sets.
+
+* Which cable companies are most frequenly complained about?
+* Which cable companies have the most inspections or violations? How has this changed over time? (Is a cable company improving or declining in performance?)
+* How quickly are complaints addressed?
+* What kinds of complaints are most frequently made?
+* Where do the most inspections occur? What are the problem spots?
+
+## Map of Inspections
+
+In this section, I will address the question of where inspections occur by creating a map that plots the locations of inspections. For this section, we will only use the **Cable Inspections** set.
+
+### Geocoding
+
+The Cable Inspections set has pretty good completion on the `Street.Address`, `Street.Type`, and `City` columns, but we cannot use those directly to use a map. What we are going to have to do is convert these addresses to geocodes, which are pairs of latitude and longitute coordinates that we *can* use to make a map, using the package `leaflet`.
+
+Here, I'm not going to make you stare at the code for how I did it, but I condensed those columns into a readable address--not a complete one, but one that you would type into Google Maps and Google would be able to (usually correctly) guess the location you're going for.
+
+```{r API.Key, include = FALSE}
+register_google(key = "REDACTED")
+getOption("ggmap")
+```
+
+```{r Clean.Address, echo = FALSE}
+# Make a new column with an address google can understand
+imp$Address = paste(paste(imp$Street.Name, imp$Street.Type, sep=" "), imp$City, "MD", sep=", ")
+head(imp$Address, 15) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive", "condensed"), full_width = F)
+```
+
+```{r Unique}
+# Count the number of distinct addresses in the set
+length(unique(imp$Address))
+```
+
+Not depicted here is the headache of learning I went through to learn about Google's Geocoding API, which is super convenient that Google offers that to everybody, but there was so much I didn't know about it, such as request limits and getting a key.
+
+Because there is a limit to how many addresses I can look up and 9060 different addresses since 2010 is too many, I am only going to look at a slice of recent inspections, from 2017 on. This gives me a manageable number of addresses. It will also make our map less cluttered and a little more relevant because of recency.
+
+```{r Slice.And.Dice, include = FALSE}
+newSlice <- filter(imp, Date.Inspected >= as.Date("2017-01-01"))
+newSlice <- newSlice[, c(1:4, 9:17)]
+# newSlice
+length(unique(newSlice$Address))
+
+#copy unique addresses only, title column, make right data type
+geocodeFetch <- as.data.frame(unique(newSlice$Address))
+names(geocodeFetch) <- c("Address")
+geocodeFetch$Address <- as.character(geocodeFetch$Address)
+```
+
+Again, not depicted here are my heroics in looping through the Addresses to fetch coordinate pairs from Google's Geocoding API. I only did it once, and permanently saved it to another .csv file so that I'm not requesting the same things repetitively (and tiring out the API).
+
+```{r Geocode.Loop, include = FALSE}
+# Loop through the addresses to get the latitude and longitude of each address and add it to the
+# origAddress data frame in new columns lat and lon
+# check it out! I learned Ctrl + Shift + C!!!! op
+# for(i in 1:nrow(geocodeFetch)) {
+#   # Print("Working...")
+#   result <- geocode(geocodeFetch$Address[i], output = "latlona", source = "google")
+#   geocodeFetch$lon[i] <- as.numeric(result[1])
+#   geocodeFetch$lat[i] <- as.numeric(result[2])
+#   #imp$geoAddress[i] <- as.character(result[3])
+# }
+# write.csv(geocodeFetch, file="2017topresentGeocodes.csv")
+geocodeFetch <- read.csv("2017topresentGeocodes.csv")
+```
+
+Congratulations to me, I have now learned how to geocode. It was a tough experience, but the good news is that it will theoretically be easier the next time around.
+
+### Prepping Data
+
+We've got to get these addresses ready for mapmaking.
+
+Here, I'm going through the list of addresses, comparing them to the original inspections records, and counting how many times each address has been inspected (still since 2017).
+
+```{r Count.Inspections.Per.Address}
+for (i in 1:nrow(geocodeFetch)) {
+  geocodeFetch$Frequency[i] <- nrow(filter(newSlice, Address == geocodeFetch$Address[i]))
+  geocodeFetch$Street[i] <- strsplit(as.character(geocodeFetch$Address[i]), ", ")[[1]][1]
+  geocodeFetch$Label[i] <- paste(geocodeFetch$Street[i], ", ", geocodeFetch$Frequency[i], ifelse(geocodeFetch$Frequency[i] == 1, " inspection", " inspections"), sep = "")
+}
+head(geocodeFetch, 15) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive", "condensed"), full_width = F)
+```
+
+### Making the Map
+
+#### Detour: A background shape
+
+Surprise, we're not done with geocoding.
+
+As I began to make the map, I realized that it would be really helpful to have an outline of Montgomery County behind the data so that the boundaries could be seen. It also helps eliminate some of the random addresses that ended up far outside of MoCo (probably due to a failed geocoding with Google (either because of an ambiguous address or Google failing)).
+
+I researched a map company called Here Technologies, whose business it is to basically collect map data and geocodes and have them available on API. Kind of like Google, except Google doesn't do shapes, just locations and stuff. Here Technologies also takes it upon themselves to store data about the regions of zip codes, counties, and so on. From what I researched, I believe they are reliable. At any rate, I'm really only going for one shape, so it's either going to be good or bad, and I won't really know which.
+
+The other place that would have this data about the shape of a county is the Census Bureau. They have some geocoding data, but from what I could look up, it wasn't readily available. There is an R package that harnesses the Census Bureau called `tigris`, but I found out that the latest edition of data it has is from 2015, which is getting pretty old by now. So I don't feel too bad about not using it.
+
+So I used the Here Technologies API to fetch a GeoJSON POLYGON object, which I manually saved in a .txt file to import into and use in this R document.
+
+```{r Mont.Co.Outline, include = FALSE}
+montco <- read_file("montgomery.txt")
+geom <- wkt2geojson(montco, feature=FALSE)
+paint <- list(
+  type = "Feature",
+  geometry = geom,
+  properties = list(
+    name = "Montgomery County",
+    style = list(
+      fillColor = "Violet",
+      weight = 2,
+      color = "#000000"
+    )
+  ),
+  id = "MontCo"
+)
+```
+
+#### (Actually) Making the Map
+
+Finally, we are here. The making of the map, using the `leaflet` R package, which works marvelously and has tons of options. I learned how to set the center of the map, the default zoom, the limitations on zoom, and use the built-in-automatic clustering. I like the clustering because it makes the dots less overwhelming at first.
+
+I also modified the size of the points based on how many inspections have occured on that street since 2017, and you can also click each dot to pull up the name of the street and the number of inspections (a label I created during data cleaning).
+
+```{r Map, echo = FALSE}
+# pal <- colorBin(palette = "Spectral", domain = geocodeFetch$Frequency, reverse = TRUE)
+m <- leaflet(geocodeFetch, options=leafletOptions(minZoom=9)) %>%
+  addTiles() %>%
+  setView(-77.194355, 39.148987, zoom=10) %>%
+  addGeoJSON(paint) %>%
+  addCircleMarkers(radius = ~log(Frequency)*8, #*100
+             color = "LimeGreen",
+             stroke = FALSE,
+             fillOpacity = 0.5,
+             popup = ~Label,
+             clusterOptions = markerClusterOptions(disableClusteringAtZoom = 13,
+                                                   spiderfyOnMaxZoom = FALSE)
+  )
+m
+```
+
+I'll take a round of applause here for the crowning achievement of my project. :D
+
+## Inspections, Violations, and Complaints by Company.
+
+Let's regress from the impressive map and go back to thinking about how different cable companies are performing. Customers or residents of MoCo may be interested to know whose services they should choose.
+
+There is one piece of information that is not present in these datasets that I was not able to find out about: the current number of customers using each company. This would have been useful in order to scale volume proportionately; unfortunately I had to make do without.
+
+In this section, I am going to use both **Cable Inspections** and **Cable Complaints**.
+
+### Prepping Data
+
+Let's start by picking columns of the **Cable Inspections** set again that we would like to use.
+
+```{r Select.Cols, echo = FALSE}
+timeSlice <- imp[,c(1:4, 9:16)]
+str(timeSlice)
+```
+
+Let's tally up attributes by company. I'm going to count the number of inspections each company got, how many were violations, how many were because of resident complaints, and then divide the number of violations by inspections to find out what percent of that company's inspections came away clean without a violation.
+
+Remember that this is for all of time from 2010 up until now. Also, the percentage proportion will vary and become more accurate as a company gets more inspections.
+
+```{r Complaints.Processing.1, echo = FALSE}
+freq <- timeSlice %>%
+  group_by(Cable.Company) %>%
+  summarize(Inspection.Count = n(), Violation = sum(Violation), Resident.Generated = sum(Resident.Generated)) %>%
+  mutate(Percent.Violation = signif(Violation / Inspection.Count, 2), Percent.Clean = signif(1 - Violation / Inspection.Count, 2))
+head(freq) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive", "condensed"), full_width = F)
+```
+
+It seems like only three companies are significantly represented here, so we'll choose only them. Also some of the fields are left blank. My presumption for this is that an inspection was made that either could not be identified to a company or was not tied to any company in particular. We'll lose those anyways when we go down to only three companies.
+
+```{r Pick.Three, echo = FALSE}
+freq <- freq %>%
+  filter(Violation > 1000)
+head(freq) %>%
+  kable() %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "responsive", "condensed"), full_width = F)
+```
+
+Let's transition to the **Cable Complaints** set.
+
+Interestingly, despite the information page on dataMontgomery claiming this data only dates back to 2010, there is a non-negligible amount of old data coming from the 2000s and even the 20th century. In order to keep things more relevant, and also matching up to the Inspections set, we're going to chop everything off before September 2010.
+
+### Complaint Categories and Time to Resolve Complaints
+
+I notice that in the Complaints set, there are a number of columns dedicated to tagging complaints with different relevant categories.
+
+```{r Slice.Complaints, include = FALSE}
+comSlice <- filter(complaints, Date.of.Complaint >= as.Date("2010-09-01"))
+comTypes <- select(comSlice, Billing, Service, Internet, Telephone.Answering.Time, Reception, Construction, Marketing, Installation, Cable.Service.Availability, Cable.Line.Related, Telephone.Service, Other)
+```
+
+I'm not sure that every complaint is only labeled with one category, so I check on that in the table below. It turns out some are labeled with more than one--in fact, up to 5, and almost 200 of the `r nrow(comTypes)` rows after 2010 have no attribute at all.
+
+```{r Num.of.Attr.Per.Row}
+table(rowSums(comTypes, na.rm = TRUE))
+```
+
+Despite the duplicates and no-attibutes, we can still make a bar graph of which categories are tagged the most.
+
+```{r Categorization.Graph, echo = FALSE}
+quick <- summarize(comTypes,
+                   Billing = sum(comTypes$Billing, na.rm = TRUE),
+                   Service = sum(comTypes$Service, na.rm = TRUE),
+                   Internet = sum(comTypes$Internet, na.rm = TRUE),
+                   Telephone.Answering.Time = sum(comTypes$Telephone.Answering.Time, na.rm = TRUE),
+                   Reception = sum(comTypes$Reception, na.rm = TRUE),
+                   Construction = sum(comTypes$Construction, na.rm = TRUE),
+                   Marketing = sum(comTypes$Marketing, na.rm = TRUE),
+                   Installation = sum(comTypes$Installation, na.rm = TRUE),
+                   Cable.Service.Availability = sum(comTypes$Cable.Service.Availability, na.rm = TRUE),
+                   Cable.Line.Related = sum(comTypes$Cable.Line.Related, na.rm = TRUE),
+                   Telephone.Service = sum(comTypes$Telephone.Service, na.rm = TRUE),
+                   Other = sum(comTypes$Other, na.rm = TRUE))
+row.names(quick) <- "Count"
+quick <- as.data.frame(t(quick))
+quick$Type <- row.names(quick)
+d <- ggplot(quick, aes(reorder(Type, desc(Type)), Count, fill = Type)) +
+  geom_col() +
+  coord_flip() +
+  geom_text(stat = "identity", aes(label = Count, y = Count + 125)) +
+  labs(title = "Categorization of Complaints", subtitle = "September 2010 to Present") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 3500)) +
+  theme(legend.position = "none",
+        plot.title = element_text(size = 15),
+        axis.title.y = element_blank())
+d
+```
+
+Something else I want to know about is how fast are complaints marked as resolved. Back when I imported the set, I did a mutation to add a column called Days.to.Resolve describing the difference between Date.of.Closure and Date.of.Complaint for each complaint. We can make a quick histogram to eyeball what's going on. (In order to see the significant columns better, I have chopped off many outliers in this graph.)
+
+```{r Speed.of.Resolve, echo = FALSE}
+e <- ggplot(comSlice, aes(Days.to.Resolve)) +
+  geom_histogram(binwidth = 1, color = "RosyBrown") +
+  xlim(0, 50) +
+  ylim(0, 1000) +
+  labs(title = "Days to Resolve a Cable Complaint",
+       subtitle = "September 2010 to Present",
+       xlab = "Days to Resolve",
+       ylab = "Number of Complaints") 
+e
+```
+
+It looks pretty good! There's a big dropoff after 7 days (1 week), and another after 15 days (a little more than 2 weeks).
+
+For some complaints, it seems like they sit in the unresolved box for a long time, for whatever reason. There are a lot of outliers reaching out to hundreds of days, but that's reasonable considering some issues will take longer to resolve.
+
+Something I noticed about the data in this area: it is not so clean. First of all, there are a couple of absolutely absurd amounts of time it takes to resolve something, like 10960 days. There is one that is 1102 days, (X) Doubt, but perhaps something took over 3 years to happen. Second of all, 23 of these times come out negative, which is a problemo. Not sure why or how a complaint can be closed before it is made. (Also, this is only for the last 2.5 years, so imagine what happens when you look at the entire dataset.)
+
+I wanted to try looking at how long it takes to resolve complaints by category of complaint. Since some complaints have more than one label, I just picked one of them (the most popular one). The complaints without labels aren't included here.
+
+```{r Speed.of.Resolve.By.Type, echo = FALSE}
+boxPlots <- data.frame(Days.to.Resolve = comSlice$Days.to.Resolve)
+for(j in 1:nrow(boxPlots)) {
+  if(!is.na(comSlice$Billing[j])) { boxPlots$Type[j] = "Billing" }
+  else if(!is.na(comSlice$Cable.Line.Related[j])) { boxPlots$Type[j] = "Cable.Line.Related" }
+  else if(!is.na(comSlice$Reception[j])) { boxPlots$Type[j] = "Reception" }
+  else if(!is.na(comSlice$Internet[j])) { boxPlots$Type[j] = "Internet" }
+  else if(!is.na(comSlice$Service[j])) { boxPlots$Type[j] = "Service" }
+  else if(!is.na(comSlice$Telephone.Service[j])) { boxPlots$Type[j] = "Telephone.Service" }
+  else if(!is.na(comSlice$Other[j])) { boxPlots$Type[j] = "Other" }
+  else if(!is.na(comSlice$Marketing[j])) { boxPlots$Type[j] = "Marketing" }
+  else if(!is.na(comSlice$Construction[j])) { boxPlots$Type[j] = "Construction" }
+  else if(!is.na(comSlice$Installation[j])) { boxPlots$Type[j] = "Installation" }
+  else if(!is.na(comSlice$Cable.Service.Availability[j])) { boxPlots$Type[j] = "Cable.Service.Availability" }
+  else if(!is.na(comSlice$Telephone.Answering.Time[j])) { boxPlots$Type[j] = "Telephone.Answering.Time" }
+}
+f <- ggplot(boxPlots, aes(reorder(Type, desc(Type)), Days.to.Resolve)) +
+  geom_boxplot(color = "RosyBrown") +
+  coord_flip() +
+  labs(title = "Days to Resolve Different Types of Complaints", subtitle = "September 2010 to Present") +
+  scale_y_continuous(breaks = seq(0, 30, 2), limits = c(0, 30)) +
+  theme(legend.position = "none",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank())
+f
+```
+
+### Cable Company Performance and Violation Rates
+
+Again, there are only three cable companies with a significant amount of data pertaining to them, so we are only looking at them.
+
+Even though we don't have information on the number of customers using each company, we can still look generally at the number of inspections and complaints per company. For this grouped bar plot, I am going to combine both sets.
+
+I am also going to pull out the number of inspections that were marked as a violation from the Inspections set, and the number of Inspections that were marked as Resident.Generated from the Inspections set.
+
+```{r Grouped.Counts, echo = FALSE}
+#sum up number of rows by cable company
+comFreq <- comSlice %>%
+  group_by(Cable.Provider) %>%
+  summarize(Count = n()) %>%
+  filter(Count > 2)
+colnames(comFreq) <- c("Cable.Company", "Complaints") #rename for the merge
+
+#create a copy so we don't mess with the old one
+combinedCables <- freq[, 1:4]
+
+#add a factor level and the dummy row
+levels(combinedCables$Cable.Company) <- c(levels(combinedCables$Cable.Company), "Inquiry")
+combinedCables[4,] = list("Inquiry", NA, NA, NA, NA, NA)
+
+#perform the merge
+combinedCables <- merge(combinedCables, comFreq, by = "Cable.Company")
+
+combinedCables <- gather(combinedCables, Category, Count, Inspection.Count, Violation, Resident.Generated, Complaints)
+combinedCables$Category <- factor(combinedCables$Category, levels = c("Inspection.Count", "Violation", "Complaints", "Resident.Generated"))
+
+g <- ggplot(combinedCables, aes(Cable.Company, Count, fill = Category)) +
+  geom_bar(position = "dodge", stat = "identity") +
+  labs(title = "Most Complained About Cable Companies in Montgomery County",
+       subtitle = "September 2010 to Present") +
+  geom_text(stat = "identity",
+            position = position_dodge(width = 0.9),
+            vjust = -0.5,
+            size = 3.5,
+            aes(label = Count, y = Count + 100)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 21000)) +
+  theme(legend.position = "right",
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.text.x = element_text(size=12))
+g
+```
+
+From this graph, we can actually see that the county performs a lot more inspections because it can and should, and not many are because of complaints. Complaints (blue) pale in comparison to the number of inspections (pink), and if the Cable Inspections and Cable Complaints sets do indeed correlate, then the number of complaints (blue) that result in inspections (purple) is not even that many (about a 1/2 rate).
+
+However, this doesn't really tell us about how companies are performing because if Comcast has more customers, it would obviously have more inspections, violations, complaints, and so on. Remember that we previously created a proportion statistic that compared the number of violations on a company to the number of inspections on a company. Let's make a quick graph for that.
+
+```{r Percent.Graph, echo = FALSE}
+h <- ggplot(freq, aes(Cable.Company, Percent.Violation, fill = Cable.Company)) +
+  geom_col() +
+  labs(title = "Percent of Inspections on a Company Resulting in Violation",
+       subtitle = "September 2010 to Present") +
+  geom_text(stat = "identity", aes(label = paste(as.character(Percent.Violation * 100), "%", sep = ""),
+                                   y = Percent.Violation + 0.05)) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1.1)) +
+  theme(legend.position = "none",
+        axis.title.x=element_blank(),
+        axis.text.x = element_text(size=12),
+        axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank())
+h
+```
+
+What would be even more interesting is how this rate changes over time. Has a company's violation rate been improving or decreasing?
+
+Let's do this year by year from 2011 (the first full year we have) until 2018 (the last full year we have).
+
+Before we get to the percent violation rate though, let's just quickly look at raw violation count over time so that we get a sense of what's going on.
+
+```{r Over.Time, include = FALSE}
+overTime <- filter(timeSlice, Date.Inspected >= as.Date("2011-01-01"), Date.Inspected < as.Date("2019-01-01"), Cable.Company == "Comcast" | Cable.Company == "RCN" | Cable.Company == "Verizon")
+overTime <- overTime %>%
+  group_by(Year = year(floor_date(Date.Inspected, "year")), Cable.Company) %>%
+  summarize(Inspection.Count = n(), Violation = sum(Violation), Resident.Generated = sum(Resident.Generated)) %>%
+  mutate(Percent.Violation = signif(Violation / Inspection.Count, 2), Percent.Clean = signif(1 - Violation / Inspection.Count, 2))
+# overTime <- overTime[-1, ] #get rid of that weird row with the year as 1023, a typo
+```
+
+```{r Violations.Time, echo = FALSE}
+#the next letters are i, j, and k, which as a programmer I'll leave to be counters, even though I'm not using counters. and l is too hard to read.
+m <- ggplot(overTime, aes(Year, Violation, color = Cable.Company)) +
+  geom_line(size = 3) +
+  geom_point(color = "black", size = 3.5) +
+  scale_x_continuous(breaks = 2011:2018) +
+  guides(linetype = guide_legend(override.aes = list(size = 3))) + 
+  labs(title = "Number of Violations Over Time",
+       subtitle = "2011 to 2018 for three companies") +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank())
+m
+```
+
+Looking at this graph gives us valuable context: *all* companies, not just one, had more violations (and also inspections) in 2011 and 2015. This spike would not have anything to do with any company in particular, but rather that perhaps the MoCo Cable Office was more busy, or perhaps there were more storms, or something else.
+
+Now let's do that percent violation rate change over time.
+
+```{r Percent.Violations.Time, echo = FALSE}
+n <- ggplot(overTime, aes(Year, Percent.Violation, color = Cable.Company)) +
+  geom_line(size = 3) +
+  geom_point(color = "black", size = 3.5) +
+  scale_x_continuous(breaks = 2011:2018) +
+  scale_y_continuous(labels = percent) +
+  guides(linetype = guide_legend(override.aes = list(size = 3))) +
+  labs(title = "Percent of Inspections Resulting in Violation Over Time",
+       subtitle = "2011 to 2018 for three companies, higher percentage is worse") +
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank())
+n
+```
+
+From this, we can see that RCN (a smaller company) has not been doing well (an observation consistent with the aggregate plot). We cannot jump to a full conclusion that RCN sucks--we have to make sure we have the full picture of information, such as maybe less false inspections are called on RCN? Maybe the cable office is more worried about Comcast and Verizon and tends to issue extra inspections on them just to be sure, lowering their violation rate? We don't know. But also maybe RCN just sucks.
+
+It is interesting to see that Comcast and Verizon have a pretty clear trend of getting worse violation rates over the past few years. Again, this is a question of whether these companies are doing worse, or the cable office is getting more efficient with their inspections. The number of violations has stayed pretty consistent, so perhaps it is the cable office being more efficient. In fact, Comcast's number of violations has dipped in recent years. However, we *still* don't know about the number of customers using these companies; maybe Comcast's number has dipped because less people are using it.
+
+## Conclusion
+
+Ultimately, we cannot make any hard conclusions because there is not enough information, but this analysis has successfully run us through the story that is present in the data available.
+
+Other things that could be done: There are some columns I didn't look at, such as `Type.Area.Inspected` and `Re.Inspection`. I have no idea whether any interesting observations happen when you categorize the data further, or how the information on `Re.Inspection` can be cleaned or harnessed to drive further identification of problem spots. (With such a large set, I imagine successfully lining up and correlating rows may be a tall task.)
+
+The dataset can be improved, obviously. If it is meant for use by the public, who may not have data science skills to process the data, it is not ready. To be used, it does require cleaning and processing. That is a question of whether dataMontgomery strives to present clean data, or whether it presents what it has with no wasted effort so that the public may clean it.
+
+In particular, the attribute rows with booleans of `1`/`NA` are not a good format to store data in--but it makes sense, each was a checkbox on a form so that the inspection/complaint could be stored. It also means multiple attributes could be selected, which is not quite as possible in a single column (but now you leave the problem to the data scientist on how to deal with condensing them into a single column, hehe).
+
+And obviously there are errors in the data, but I'm not sure whether that can really be fixed or not.
+
+Overall, this was a fun project and besides all the findings and work, I enjoyed the process and learning new skills.
